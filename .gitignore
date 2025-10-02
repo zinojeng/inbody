@@ -1,0 +1,29 @@
+# Python cache and artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE and editor settings
+.idea/
+.vscode/
+.DS_Store
+.env
+.env.*
+.python-version
+
+# Local data outputs
+data/inbody_clean/
+data/*.csv
+data/*.jpg
+
+# Reports generated during analysis
+*.docx
+*.pdf
