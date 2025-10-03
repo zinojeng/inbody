@@ -2,6 +2,18 @@
 
 本程式用來從 InBody CSV 報表自動擷取常用指標，並輸出成結構化檔案與文字摘要，方便後續統計或製作報告。
 
+## 互動式網頁介面（Streamlit）
+
+想以更友善的方式產出報告，可啟動內建的 Streamlit 應用：
+
+1. 安裝依賴：`pip install -r requirements.txt`
+2. 啟動服務：`streamlit run streamlit_app.py`
+3. 瀏覽器開啟預設網址（通常為 `http://localhost:8501`）。
+4. 在側邊欄輸入 OpenAI API Key（選填）、選擇模型。
+5. 上傳 InBody 原始 CSV 後按下「產出報告」，即可下載 Markdown 並線上預覽。
+
+未提供 API Key 時，系統會自動改用內建的規則式摘要；提供金鑰則會呼叫 GPT 產出完整個人化報告。
+
 ## 如何使用（重點說明）
 
 1. 將 InBody 匯出的 CSV 放到 `data/`（或任何你喜歡的位置）。
@@ -32,7 +44,7 @@
 ## 執行環境
 
 - Python 3.9 以上（建議 3.10+）。
-- 需安裝的第三方套件請參考 `requirements.txt`（若無檔案，表示目前僅使用標準函式庫）。
+- 必要套件請參考 `requirements.txt`（內含 `pandas`、`streamlit`、`openai` 與 `python-dotenv`）。
 
 ## 疑難排解
 
@@ -65,3 +77,15 @@
 > ⚠️ `.env` 已列入 `.gitignore`，請勿將含有金鑰的檔案提交至版本控制。
 
 進階設定：如使用 `sk-proj-...` 專案金鑰，可在 `.env` 內補充 `OPENAI_PROJECT=proj_xxxxx`；若使用自訂端點，亦可設定 `OPENAI_BASE_URL`。
+
+## 部署到 Zeabur
+
+本專案已提供 Dockerfile，能直接在 Zeabur 建立容器服務：
+
+1. 將專案推送到 Git 儲存庫，於 Zeabur 後台建立新服務並選擇「Dockerfile」作為部署來源。
+2. Zeabur 會自動使用根目錄的 `Dockerfile` 建置映像檔，無需額外指定 Build/Run 指令。
+3. 在服務的環境變數設定 `OPENAI_API_KEY`（必要時再加上 `OPENAI_BASE_URL`、`OPENAI_PROJECT` 等參數）。
+4. Zeabur 預設會提供 `PORT` 環境變數，容器會以該埠啟動 Streamlit；若需自訂可以在面板覆寫。
+5. 部署完成後，即可透過 Zeabur 產生的網址造訪 Streamlit 介面，進行 CSV 上傳與報告產出。
+
+> 若想啟用持續部署，建議在 Zeabur 中啟用 auto deploy，或於 PR 合併後手動觸發重新部署。

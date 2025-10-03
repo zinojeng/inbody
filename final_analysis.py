@@ -5,8 +5,9 @@ import argparse
 import csv
 import json
 import os
+import re
 import textwrap
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -91,7 +92,9 @@ class MetricStore:
 
 
 REFERENCE_DEFAULT = Path("reference")
-DEFAULT_GPT_MODEL = os.getenv("DEFAULT_GPT_MODEL", "gpt-4.1")
+ASCII_CITATION_PATTERN = re.compile(r"\[(\d+)(?:[^\]]*)\]")
+FULLWIDTH_CITATION_PATTERN = re.compile(r"［(\d+)(?:[^］]*)］")
+DEFAULT_GPT_MODEL = os.getenv("DEFAULT_GPT_MODEL", "gpt-5")
 FALLBACK_GPT_MODEL = os.getenv("FALLBACK_GPT_MODEL", "gpt-4o-mini")
 
 
@@ -196,6 +199,36 @@ def load_reference_sections(reference_path: Path) -> List[str]:
     return [section for section in sections if section]
 
 
+REFERENCE_LINE_PATTERN = re.compile(r"^(\d+)\.\s*(.+)$")
+
+
+def load_reference_index(reference_path: Path) -> Dict[str, str]:
+    if not reference_path.exists():
+        return {}
+
+    paths: List[Path] = []
+    if reference_path.is_dir():
+        for candidate in sorted(reference_path.rglob("*")):
+            if candidate.is_file() and candidate.suffix.lower() in {".md", ".txt"}:
+                paths.append(candidate)
+    else:
+        paths.append(reference_path)
+
+    index: Dict[str, str] = {}
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            match = REFERENCE_LINE_PATTERN.match(line)
+            if match:
+                number, content = match.groups()
+                index[number] = content.strip()
+    return index
+
+
 def extract_keywords_for_scoring(store: MetricStore) -> List[str]:
     terms: List[str] = []
     key_map = {
@@ -270,9 +303,6 @@ def generate_gpt_insights(
     reference_sections: List[str],
     model: str,
     temperature: Optional[float],
-    reasoning_effort: Optional[str],
-    verbosity: Optional[str],
-    max_output_tokens: Optional[int],
 ) -> Optional[str]:
     if OpenAI is None:
         raise RuntimeError("openai package未安裝，無法啟用 GPT 分析")
@@ -310,39 +340,54 @@ def generate_gpt_insights(
           5. 飲食策略與補充建議：至少 3 條具體建議，需引用個人數值（如體重 71.8 kg、蛋白質鎖定範圍）並說明該建議如何改善風險。
           6. 訓練與恢復處方：至少 3 條建議，需結合左右肢肌肉差異、相位角等資料，避免制式建議。
           7. 監測指標與追蹤計畫：列出主要/次要 KPI 與建議追蹤週期，需附上數值目標（例如 VFA 目標、PBF 目標）。
-          8. 結語與後續策略：至少 4 句話，總結核心風險、身體重組目標、追蹤時間表與合作醫療/教練建議。
-          9. References：列出報告引用之文獻或指標來源，格式參照 [InBody報告深度文獻分析.md] 中的原始資料。
+          8. 結語：至少 3 句話，呼應 C 型輪廓與內臟脂肪風險，點出下一步行動與複測節奏。
         - 若資料不足請明確註記「資料不足」。
         - 引用參考內容時以內文方式呈現（例如「[參考 22]」）。
         - 避免制式、泛用句型，每個段落須結合個人化數據，明確說明建議與體脂、肌肉、水分或相位角的關聯。
         """
     ).strip()
-    request_payload = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": "你是專業的運動醫學與營養顧問。"},
-            {"role": "user", "content": prompt},
-        ],
-    }
-    if model.startswith("gpt-5"):
-        if reasoning_effort:
-            request_payload.setdefault("reasoning", {})["effort"] = reasoning_effort
-        if verbosity:
-            request_payload.setdefault("text", {})["verbosity"] = verbosity
-        if max_output_tokens is not None:
-            request_payload["max_output_tokens"] = max_output_tokens
-    else:
-        if temperature is not None:
+    system_prompt = "你是專業的運動醫學與營養顧問。"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+
+    supports_temperature = True
+    if model and str(model).lower().startswith("gpt-5"):
+        supports_temperature = False
+
+    if hasattr(client, "responses"):
+        request_payload = {
+            "model": model,
+            "input": messages,
+        }
+        if temperature is not None and supports_temperature:
             request_payload["temperature"] = temperature
-    response = client.responses.create(**request_payload)
-    output = getattr(response, "output_text", None)
+        response = client.responses.create(**request_payload)
+        output = getattr(response, "output_text", None)
+        if not output:
+            # 對於新版 SDK，responses.create 會返回 content 字串列表
+            try:
+                output = "".join(part.text for part in response.output if part.type == "output_text")
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                raise RuntimeError(f"GPT 回應解析失敗: {exc}")
+        return output.strip() if output else None
+
+    # 舊版 openai SDK 不支援 responses API，退回 chat.completions
+    chat = getattr(client, "chat", None)
+    completions = getattr(chat, "completions", None) if chat else None
+    if completions is None:
+        raise RuntimeError("目前的 openai 套件版本過舊，請升級到 1.55 以上或改用 responses API。")
+
+    request_kwargs = {"model": model, "messages": messages}
+    if temperature is not None and supports_temperature:
+        request_kwargs["temperature"] = temperature
+    completion = completions.create(**request_kwargs)
+    choice_message = completion.choices[0].message if completion.choices else None
+    output = getattr(choice_message, "content", None)
     if not output:
-        # 對於新版 SDK，responses.create 會返回 content 字串列表
-        try:
-            output = "".join(part.text for part in response.output if part.type == "output_text")
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            raise RuntimeError(f"GPT 回應解析失敗: {exc}")
-    return output.strip() if output else None
+        raise RuntimeError("GPT 回應解析失敗（chat.completions 無內容）。")
+    return output.strip()
 def load_from_json(path: Path) -> Dict[str, object]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(data, dict):
@@ -681,28 +726,173 @@ def build_clinical_summary(store: MetricStore) -> List[str]:
     ecw_tbw = store.get_number(*KEYS["ecw_tbw"])
     trunk_phase = store.get_number(*KEYS.get("phase_tr", []))
     fat_control = store.get_number(*KEYS["bfm_control"])
+    vfl = store.get_number(*KEYS.get("vfl", []))
+    gender = store.get_text(*KEYS["gender"]) if "gender" in KEYS else None
+    bmr = store.get_number(*KEYS.get("bmr", []))
+    smi = store.get_number(*KEYS.get("smi", []))
+    score = store.get_number(*KEYS.get("inbody_score", []))
+    tbw = store.get_number(*KEYS.get("tbw", []))
+    icw = store.get_number(*KEYS.get("icw", []))
+    ecw = store.get_number(*KEYS.get("ecw", []))
+    tbw_ffm = store.get_number(*KEYS.get("tbw_ffm", []))
+    bcm = store.get_number(*KEYS.get("bcm", []))
+    lean_ra = store.get_number(*KEYS.get("lean_ra", []))
+    lean_la = store.get_number(*KEYS.get("lean_la", []))
+    lean_rl = store.get_number(*KEYS.get("lean_rl", []))
+    lean_ll = store.get_number(*KEYS.get("lean_ll", []))
+    vfl_map = {0: "最低", 1: "極低", 2: "偏低", 3: "低", 4: "稍高", 5: "中等", 6: "偏高", 7: "高", 8: "很高", 9: "極高", 10: "危險"}
     lines: List[str] = []
-    if smm is not None and weight is not None and bfm is not None:
-        if weight - smm > 20:
-            lines.append("身體組成呈現 InBody C 型輪廓，骨骼肌量相對體重與脂肪不足，屬肌少型肥胖高風險族群。[1][14]")
+    if smm is not None and bfm is not None:
+        muscle_text = f"骨骼肌量 {smm:.1f} kg"
+        fat_text = f"體脂肪量 {bfm:.1f} kg"
+        muscle_gap: Optional[float]
+        if weight is not None and weight > 0:
+            smm_ratio = smm / weight * 100
+            bfm_ratio = bfm / weight * 100
+            muscle_text += f"（佔體重 {smm_ratio:.1f}%）"
+            fat_text += f"（約 {bfm_ratio:.1f}% 體脂）"
+            muscle_gap = weight - smm
+            c_shape_flag = muscle_gap > 20 or (pbf is not None and pbf >= 25)
+        else:
+            muscle_gap = None
+            c_shape_flag = pbf is not None and pbf >= 25
+        details = f"{muscle_text}、{fat_text}"
+        if muscle_gap is not None:
+            details += f"，體重-骨骼肌差 {muscle_gap:.1f} kg"
+        if c_shape_flag:
+            details += (
+                "，呈現 InBody C 型輪廓（肌肉量柱狀圖相對脂肪柱較短），代表軀幹與四肢肌肉量支撐不足；"
+                "需以阻力訓練與熱量管理同步提升肌脂比。[1][14]"
+            )
+        else:
+            details += "，為設定訓練與飲食目標的核心 KPI。[1][14]"
+        lines.append(details)
+
     if bmi is not None and pbf is not None:
-        if bmi < 25 and pbf >= 20:
-            lines.append(f"BMI {bmi:.1f} 與體脂率 {pbf:.1f}% 組合指向正常體重肥胖的代謝風險。[2][12]")
-    if vfa is not None:
-        lines.append(f"內臟脂肪面積 {vfa:.1f} cm² 是代謝症候群鏈條的核心驅動，需要優先干預。[22]")
+        bmi_class = classify_bmi(bmi)
+        pbf_class = classify_pbf(pbf, gender)
+        risk_clause = "需警覺內臟脂肪牽引的代謝風險" if bmi < 25 and pbf >= 20 else "建議持續穩定監測月度變化"
+        lines.append(
+            f"BMI {bmi:.1f}（{bmi_class}）與體脂率 {pbf:.1f}%（{pbf_class}），{risk_clause}。[2][12]"
+        )
+
+    if vfa is not None or vfl is not None:
+        components: List[str] = []
+        if vfa is not None:
+            components.append(f"內臟脂肪面積 {vfa:.1f} cm²")
+        if vfl is not None:
+            components.append(f"等級 {vfl:.0f}")
+        status: List[str] = []
+        if vfa is not None:
+            if vfa >= 120:
+                status.append("臨床極高風險，建議医疗團隊密切監測")
+            elif vfa >= 100:
+                status.append("超過 100 cm² 高風險門檻")
+            elif vfa >= 70:
+                status.append("高於亞洲族群建議上限 70 cm²")
+            elif vfa >= 50:
+                status.append("突破 50 cm² 健康警戒，需要加速腰腹調整")
+            else:
+                status.append("維持在健康區間，持續觀察")
+        if vfl is not None:
+            if vfl >= 10:
+                status.append("等級 ≥10，內臟脂肪堆積加劇")
+            elif vfl >= 5:
+                status.append(
+                    f"等級位於監測上緣（VFL {vfl:.0f}，{vfl_map.get(int(vfl), '中等')}），須留意復胖風險"
+                )
+            else:
+                status.append("等級仍在低風險範圍")
+        visceral_priority = (vfa is not None and vfa >= 50) or (vfl is not None and vfl >= 5)
+        action = "需把腰腹訓練與飲食控糖視為第一優先" if visceral_priority else "維持現有生活型態並定期複測"
+        base_text = " / ".join(components)
+        if status:
+            lines.append(f"{base_text}，{'；'.join(status)}，{action}。[22]")
+        else:
+            lines.append(f"{base_text}，{action}。[22]")
+
     if ecw_tbw is not None or trunk_phase is not None:
-        protective = []
+        segments: List[str] = []
         if ecw_tbw is not None:
-            protective.append(f"ECW/TBW {ecw_tbw:.3f}")
+            if ecw_tbw >= 0.39:
+                segments.append(f"ECW/TBW {ecw_tbw:.3f} 高於 0.39，暗示外液滯留或睡眠恢復不足")
+            elif ecw_tbw <= 0.360:
+                segments.append(f"ECW/TBW {ecw_tbw:.3f} 偏低，注意水分與電解質補充")
+            else:
+                segments.append(f"ECW/TBW {ecw_tbw:.3f} 落在 0.36-0.39，水分平衡穩定")
         if trunk_phase is not None:
-            protective.append(f"軀幹相位角 {trunk_phase:.1f}°")
-        if protective:
-            lines.append("、".join(protective) + " 顯示細胞環境仍具韌性，可作為改善計畫的緩衝資源。[27]")
+            if trunk_phase < 5.5:
+                segments.append(
+                    f"軀幹相位角 {trunk_phase:.1f}° 偏低，推測細胞膜電阻下降；須加強蛋白質與睡眠修復"
+                )
+            elif trunk_phase >= 7.5:
+                segments.append(
+                    f"軀幹相位角 {trunk_phase:.1f}° 高於 7.5°，代表細胞活性與恢復效率佳"
+                )
+            else:
+                segments.append(
+                    f"軀幹相位角 {trunk_phase:.1f}° 居於中段（約 5.5-7.5° 被視為穩定範圍），維持規律訓練與恢復節奏"
+                )
+        if segments:
+            lines.append("；".join(segments) + "。")
+
+    limb_snapshots: List[str] = []
+    if lean_ra is not None and lean_la is not None:
+        arms_diff = abs(lean_ra - lean_la)
+        avg_arms = (lean_ra + lean_la) / 2 if (lean_ra + lean_la) != 0 else 0
+        if avg_arms > 0:
+            diff_pct = arms_diff / avg_arms * 100
+            balance_note = f"差 {diff_pct:.1f}%" if diff_pct >= 5 else "左右差 <5%"
+        else:
+            balance_note = "資料不足"
+        limb_snapshots.append(f"上肢肌肉 {lean_ra:.2f}/{lean_la:.2f} kg（{balance_note}）")
+    if lean_rl is not None and lean_ll is not None:
+        legs_diff = abs(lean_rl - lean_ll)
+        avg_legs = (lean_rl + lean_ll) / 2 if (lean_rl + lean_ll) != 0 else 0
+        if avg_legs > 0:
+            diff_pct = legs_diff / avg_legs * 100
+            balance_note = f"差 {diff_pct:.1f}%" if diff_pct >= 5 else "左右差 <5%"
+        else:
+            balance_note = "資料不足"
+        limb_snapshots.append(f"下肢肌肉 {lean_rl:.2f}/{lean_ll:.2f} kg（{balance_note}）")
+    if limb_snapshots:
+        lines.append("四肢肌肉平衡: " + "；".join(limb_snapshots) + "，依此調整單側與矯正訓練。")
+
     if fat_control is not None:
         target = abs(fat_control)
-        lines.append(f"首要身體重組目標：在維持 31.7 kg 骨骼肌量的前提下減脂約 {target:.1f} kg，並壓低內臟脂肪。")
+        direction = "減脂" if fat_control < 0 else "增脂"
+        smm_text = f"維持 {smm:.1f} kg 骨骼肌量" if smm is not None else "維持既有骨骼肌量"
+        lines.append(f"首要身體重組目標：在 {smm_text} 的前提下{direction}{target:.1f} kg，並壓低內臟脂肪。")
+
+    if bmr is not None:
+        lines.append(
+            f"基礎代謝率 {bmr:.0f} kcal（同齡男性常見範圍 1500-1700 kcal），建議以阻力訓練搭配蛋白質補充維持代謝動力。"
+        )
+
+    if smi is not None:
+        smi_threshold = 7.0 if gender and gender.lower().startswith("m") else 5.7
+        status = "高於肌少症門檻" if smi >= smi_threshold else "低於肌少症門檻" if smi < smi_threshold else "資料不足"
+        lines.append(f"SMI {smi:.1f}（{status}），持續維持下肢力量並定期評估步態。")
+
+    if score is not None:
+        lines.append(f"InBody 分數 {score:.0f}，距離 80 分健康門檻仍有差距，建議 8-12 週後複測追蹤。")
+
+    if tbw is not None or (icw is not None and ecw is not None):
+        water_parts: List[str] = []
+        if tbw is not None:
+            water_parts.append(f"TBW {tbw:.1f} L")
+        if icw is not None and ecw is not None:
+            water_parts.append(f"ICW/ECW {icw:.1f}/{ecw:.1f} L")
+        if tbw_ffm is not None:
+            water_parts.append(f"TBW/FFM {tbw_ffm:.1f}%")
+        if water_parts:
+            lines.append("體液指標：" + "，".join(water_parts) + "，維持水分與電解質平衡可支撐訓練恢復。")
+
+    if bcm is not None:
+        lines.append(f"BCM {bcm:.1f} kg 反映細胞活性與肌肉品質，是觀察訓練成效的重要補充 KPI。")
+
     if not lines:
-        lines.append("目前資料不足以形成臨床摘要。")
+        return ["目前資料不足以形成臨床摘要。"]
     return lines
 
 
@@ -899,7 +1089,29 @@ def build_monitoring_targets(store: MetricStore) -> List[str]:
     return lines
 
 
-def build_report(store: MetricStore, gpt_insights: Optional[str] = None) -> str:
+def renumber_citations(lines: List[str], _reference_index: Dict[str, str]) -> Tuple[List[str], List[str]]:
+    def strip_reference_labels(text: str) -> str:
+        text = re.sub(r"\[\s*參考\s*([^\]]+)\]", lambda m: f"[{m.group(1).strip()}]", text)
+        text = re.sub(r"［\s*參考\s*([^］]+)］", lambda m: f"[{m.group(1).strip()}]", text)
+        return text
+
+    cleaned_lines = [strip_reference_labels(line) for line in lines]
+    updated_lines: List[str] = []
+    for line in cleaned_lines:
+        line = ASCII_CITATION_PATTERN.sub("", line)
+        line = FULLWIDTH_CITATION_PATTERN.sub("", line)
+        line = re.sub(r"【\s*參考[^】]*】", "", line)
+        line = re.sub(r"內文已以「」標註[：:]*\s*", "", line)
+        line = re.sub(r"\s{2,}", " ", line)
+        updated_lines.append(line)
+    return updated_lines, []
+
+
+def build_report(
+    store: MetricStore,
+    gpt_insights: Optional[str] = None,
+    reference_index: Optional[Dict[str, str]] = None,
+) -> str:
     if gpt_insights:
         report = gpt_insights.strip()
         if not report.endswith("\n"):
@@ -945,6 +1157,7 @@ def build_report(store: MetricStore, gpt_insights: Optional[str] = None) -> str:
         ("營養策略", recommend_nutrition_strategy(store)),
         ("訓練與修復策略", recommend_training_strategy(store)),
         ("階段性監測指標", build_monitoring_targets(store)),
+        ("附註說明", build_appendix_notes(store)),
     ]
 
     if gpt_insights:
@@ -962,7 +1175,26 @@ def build_report(store: MetricStore, gpt_insights: Optional[str] = None) -> str:
     summary_points = build_summary(store)
     lines.extend(f"- {point}" for point in summary_points)
     lines.append("")
-    return "\n".join(lines).strip() + "\n"
+
+    final_lines, reference_entries = renumber_citations(lines, reference_index or {})
+    if reference_entries:
+        final_lines.append("## References")
+        final_lines.extend(f"- {entry}" for entry in reference_entries)
+        final_lines.append("")
+    report_text = "\n".join(final_lines).strip() + "\n"
+    report_text = re.sub(r"文中引用之數字編號[^\n]+\n?", "", report_text)
+    report_text = re.sub(r"\[\s*參考[^\]]*\]", "", report_text)
+    report_text = re.sub(r"［\s*參考[^］]*］", "", report_text)
+    report_text = re.sub(r"【\s*參考[^】]*】", "", report_text)
+    report_text = re.sub(r"\[[^\]]*\d+[^\]]*\]", "", report_text)
+    report_text = re.sub(r"［[^］]*\d+[^］]*］", "", report_text)
+    report_text = re.sub(r"（\s*見\s*）", "", report_text)
+    report_text = re.sub(r"\(\s*見\s*\)", "", report_text)
+    report_text = re.sub(r"見\s*$", "", report_text, flags=re.MULTILINE)
+    report_text = re.sub(r"\s{2,}", " ", report_text)
+    report_text = re.sub(r"\(\s*\)", "", report_text)
+    report_text = re.sub(r"（\s*）", "", report_text)
+    return report_text
 
 
 def build_summary(store: MetricStore) -> List[str]:
@@ -1075,6 +1307,40 @@ def build_summary(store: MetricStore) -> List[str]:
     return summary
 
 
+def build_appendix_notes(store: MetricStore) -> List[str]:
+    smm = store.get_number(*KEYS.get("smm", []))
+    bfm = store.get_number(*KEYS.get("bfm", []))
+    weight = store.get_number(*KEYS.get("weight_kg", []))
+    vfa = store.get_number(*KEYS.get("vfa", []))
+    vfl = store.get_number(*KEYS.get("vfl", []))
+    trunk_phase = store.get_number(*KEYS.get("phase_tr", []))
+
+    notes: List[str] = []
+    notes.append(
+        "**C 型輪廓**：InBody 透過五大柱狀圖比較肌肉與脂肪；當肌肉柱顯著低於脂肪柱時即稱 C 型，代表肌肉支撐不足且脂肪偏高，必須同步強化阻力訓練與熱量管理。"
+    )
+    notes.append(
+        "**內臟脂肪分級**：<50 cm² 為安全、50-70 cm² 為警戒、70-100 cm² 為高風險、≥100 cm² 屬極高風險；若 VFL ≥10 則需醫療團隊密切追蹤。"
+    )
+    notes.append(
+        "**相位角判讀**：5.5° 以下視為偏低、5.5-7.5° 為穩定範圍、7.5° 以上代表細胞活性佳；相位角受睡眠、營養與訓練恢復影響。"
+    )
+    if vfa is not None or vfl is not None:
+        notes.append(
+            f"**本次內臟脂肪**：面積 {format_number(vfa, ' cm²')}、等級 {format_number(vfl)}，建議透過核心訓練與控糖飲食持續下降。"
+        )
+    if trunk_phase is not None:
+        notes.append(
+            f"**本次相位角**：軀幹 {format_number(trunk_phase, '°')}，可作為細胞恢復與營養補充成效的追蹤指標。"
+        )
+    if smm is not None and bfm is not None:
+        clause = "，顯示肌肉柱略短於脂肪柱" if weight is not None and weight - smm > 20 else ""
+        notes.append(
+            f"**肌脂對照**：骨骼肌量 {format_number(smm, ' kg')} / 體脂肪量 {format_number(bfm, ' kg')}{clause}，為評估 C 型改善幅度的重要指標。"
+        )
+    return notes
+
+
 def default_input_path(base: Path) -> Optional[Path]:
     search_dirs = [
         base,
@@ -1098,12 +1364,11 @@ def run(
     reference_path: Optional[Path] = None,
     model: str = DEFAULT_GPT_MODEL,
     temperature: Optional[float] = 0.3,
-    reasoning_effort: Optional[str] = None,
-    verbosity: Optional[str] = None,
-    max_output_tokens: Optional[int] = None,
 ) -> Path:
     store = load_metrics(input_path)
-    reference_sections = load_reference_sections(reference_path or REFERENCE_DEFAULT)
+    reference_base = reference_path or REFERENCE_DEFAULT
+    reference_sections = load_reference_sections(reference_base)
+    reference_index = load_reference_index(reference_base)
     gpt_text: Optional[str] = None
     if use_gpt:
         candidate_models: List[str] = []
@@ -1114,15 +1379,7 @@ def run(
         last_error: Optional[Exception] = None
         for candidate in candidate_models:
             try:
-                gpt_text = generate_gpt_insights(
-                    store,
-                    reference_sections,
-                    candidate,
-                    temperature,
-                    reasoning_effort,
-                    verbosity,
-                    max_output_tokens,
-                )
+                gpt_text = generate_gpt_insights(store, reference_sections, candidate, temperature)
                 if candidate != model:
                     print(f"[GPT] 主模型 '{model}' 失敗，已改用 '{candidate}'。")
                 break
@@ -1131,7 +1388,7 @@ def run(
                 last_error = exc
         if gpt_text is None and last_error is not None:
             print("[GPT] 無法產生個人化分析，改用內建規則式摘要。")
-    report = build_report(store, gpt_text)
+    report = build_report(store, gpt_text, reference_index)
     destination = output_path or input_path.with_name("inbody_final_report.md")
     destination.write_text(report, encoding="utf-8")
     return destination
@@ -1154,23 +1411,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         type=float,
         default=0.3,
         help="Sampling temperature for GPT generation (omit with value -1 to disable)",
-    )
-    parser.add_argument(
-        "--reasoning-effort",
-        type=str,
-        choices=["minimal", "low", "medium", "high"],
-        help="GPT-5 專用：設定推理強度",
-    )
-    parser.add_argument(
-        "--verbosity",
-        type=str,
-        choices=["low", "medium", "high"],
-        help="GPT-5 專用：控制輸出詳盡程度",
-    )
-    parser.add_argument(
-        "--max-output-tokens",
-        type=int,
-        help="GPT-5 專用：限制輸出字數",
     )
     return parser.parse_args(argv)
 
@@ -1209,9 +1449,6 @@ def main() -> None:
         reference_path=reference_path,
         model=args.model,
         temperature=temperature,
-        reasoning_effort=args.reasoning_effort,
-        verbosity=args.verbosity,
-        max_output_tokens=args.max_output_tokens,
     )
     print(f"Final report written to {destination}")
 
